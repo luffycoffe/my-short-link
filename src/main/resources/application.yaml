@@ -2,10 +2,12 @@
 server:
   port: 8080
   servlet:
-   context-path: /api
+    context-path: /api
 
 # 数据源配置
 spring:
+  profiles:
+    active: dev
   application:
    name: short-link-platform
   datasource:

@@ -1,6 +1,4 @@
 spring:
-  profiles:
-    active: prod
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/short-link?useSSL=false&serverTimezone=UTC
@@ -9,11 +7,11 @@ spring:
     hikari:
       maximum-pool-size: 20
       minimum-idle: 5
-      connect-timeout: 30000
+      connection-timeout: 30000
       idle-timeout: 600000
   data:
     redis:
-      host: prod-redis
+      host: 192.168.106.130
       port: 6379
       password: 123321
       database: 2
@@ -27,12 +25,6 @@ short-link:
     expire-seconds: 86400
   domain: http://localhost:8080/api
 
-mybatis-plus:
-  mapper-locations: classpath:mapper/*.xml
-  type-aliases-package: com.liu.shortlinkplatform.entity
-  configuration:
-    map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
 
 logging:
   level:

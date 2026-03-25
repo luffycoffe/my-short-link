@@ -1,6 +1,4 @@
 spring:
-  profiles:
-    active: test
     #数据库配置
   datasource:
       driver-class-name: com.mysql.jdbc.Driver
@@ -27,5 +25,5 @@ short-link:
 #日志级别设置
 logging:
   level:
-    com.liu.com.liu.shortlinkplatform: debug
+    com.liu.shortlinkplatform: debug
     root: info
