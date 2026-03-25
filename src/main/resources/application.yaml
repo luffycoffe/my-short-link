@@ -53,4 +53,10 @@ short-link:
     expire-seconds: 86400
   code:
     min-length: 6
-
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html

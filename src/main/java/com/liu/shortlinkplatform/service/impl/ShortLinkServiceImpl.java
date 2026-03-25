@@ -8,6 +8,7 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.repository.AbstractRepository;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.liu.shortlinkplatform.common.Result;
+import com.liu.shortlinkplatform.config.ShortLinkBloomFilter;
 import com.liu.shortlinkplatform.config.ShortLinkConfig;
 import com.liu.shortlinkplatform.dto.ShortLinkCreateDto;
 import com.liu.shortlinkplatform.dto.ShortLinkStatDto;
@@ -53,6 +54,9 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private ShortLinkAccessLogMapper accessLogMapper;
+
+    @Resource
+    private ShortLinkBloomFilter shortLinkBloomFilter;
 
     /**
      * 创建短链接
@@ -123,6 +127,9 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
             throw new BusinessException("短链接创建失败");
         }
 
+        //布隆过滤器：新增短码
+        shortLinkBloomFilter.add(codeShort);
+
         //缓存预热（Redis)
         String cacheKey = shortLinkConfig.getCache().getPrefix() + codeShort;
         Long expireSeconds;
@@ -138,13 +145,15 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
             // 使用配置文件的默认过期时间
             expireSeconds = shortLinkConfig.getCache().getExpireSeconds();
         }
+        //写入Redis Hash
+        //存储长连接
+        stringRedisTemplate.opsForHash().put(cacheKey, "longUrl", dto.getLongUrl());
         if (dto.getExpireTime()!=null){
             //存储过期时间戳
             Date expireDate = DateUtil.parse(dto.getExpireTime(), "yyyy-MM-dd HH:mm:ss");
             stringRedisTemplate.opsForHash().put(cacheKey, "expireTime", String.valueOf(expireDate.getTime()));
         }
-        //存储长连接
-        stringRedisTemplate.opsForHash().put(cacheKey, "longUrl", dto.getLongUrl());
+
         //设置Redis过期时间
         stringRedisTemplate.expire(cacheKey,expireSeconds , TimeUnit.SECONDS);
         //拼接完整短链接
@@ -152,26 +161,27 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
         return Result.success(shortUrl);
     }
 
+
+
     /**
      * 短链接跳转
      */
     @Override
     public Result<String> getLongUrlByShortCode(String shortCode){
+        // 布隆过滤器拦截无效短码
+        if (!shortLinkBloomFilter.contains(shortCode)){
+            log.warn("布隆过滤拦截无效短码：{}",shortCode);
+            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
+        }
+
         log.info("短链接跳转开始，shortCode={}",shortCode);
         //检验短码合法性
         if(!this.shortCode.isValidShortCode(shortCode)){
             throw new BusinessException("短码不合法");
         }
-        //查Redis缓存
+
         String cacheKey = shortLinkConfig.getCache().getPrefix() + shortCode;
-       /* String longUrl = stringRedisTemplate.opsForValue().get(cacheKey);
-        if (StrUtil.isNotBlank(longUrl)){
-            log.info("从Redis缓存中获取短链接成功，key={},value={}",cacheKey,longUrl);
-            //异步记录访问日志
-            recordAccessLog(shortCode,getClientIp());
-            updateVisitCount(shortCode);
-            return Result.success(longUrl);
-        }*/
+        //查Redis缓存
         if (stringRedisTemplate.hasKey(cacheKey)) {
             String longUrl = (String) stringRedisTemplate.opsForHash().get(cacheKey, "longUrl");
             String expireTime = (String) stringRedisTemplate.opsForHash().get(cacheKey, "expireTime");
@@ -182,12 +192,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
                     //缓存已过期
                     stringRedisTemplate.delete(cacheKey);
                     log.debug("缓存已过期，key={}", cacheKey);
-                } else {
-                    log.info("从Redis缓存中获取短链接成功，key={},value={}", cacheKey, longUrl);
-                    //异步记录访问日志
-                    recordAccessLog(shortCode, getClientIp());
-                    updateVisitCount(shortCode);
-                    return Result.success(longUrl);
+                    throw new BusinessException(ResultCodeEnum.SHORT_LINK_EXPIRED);
                 }
             } else {
                 //缓存默认过期时间
@@ -219,9 +224,11 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
             throw new BusinessException(ResultCodeEnum.SHORT_LINK_EXPIRED);
         }
         //写回缓存
-        stringRedisTemplate.opsForValue().set(cacheKey, shortLinkEntity.getLongUrl(),
-                shortLinkConfig.getCache().getExpireSeconds(),TimeUnit.SECONDS);
-
+        stringRedisTemplate.opsForValue().set(cacheKey, shortLinkEntity.getLongUrl());
+        if (shortLinkEntity.getExpireTime() != null){
+            stringRedisTemplate.opsForHash().put(cacheKey, "expireTime",String.valueOf(shortLinkEntity.getExpireTime().getTime()));
+        }
+        stringRedisTemplate.expire(cacheKey, shortLinkConfig.getCache().getExpireSeconds(), TimeUnit.SECONDS);
         //记录访问日志和更新次数
         recordAccessLog(shortCode,getClientIp());
         updateVisitCount(shortCode);
