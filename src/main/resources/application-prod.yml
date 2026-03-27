@@ -55,3 +55,19 @@ springdoc:
   swagger-ui:
     enabled: true
     path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      # 暴露所有监控端点
+      exposure:
+        include: '*'
+  metrics:
+    tags:
+      # 给当前应用打个标记，方便Grafana识别
+      application: short-link-platform
+  prometheus:
+    metrics:
+      # 开启Prometheus格式指标
+      export:
+        enabled: true
