@@ -6,6 +6,11 @@ server:
 
 # 数据源配置
 spring:
+  cloud:
+    sentinel:
+      # 关闭控制台（本地简单使用，无需部署控制台）
+      enabled: true
+      web-context-unify: false
   profiles:
     active: dev
   application:
@@ -29,6 +34,15 @@ spring:
           time-between-eviction-runs: 10s
   jackson:
     default-property-inclusion: non_null
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    # 消息确认
+    publisher-confirm-type: correlated
+    publisher-returns: true
+
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
   type-aliases-package: com.liu.shortlinkplatform.entity
@@ -60,3 +74,9 @@ springdoc:
   swagger-ui:
     enabled: true
     path: /swagger-ui.html
+
+#Knife4j配置
+knife4j:
+    enable: true
+
+

@@ -1,13 +1,15 @@
 package com.liu.shortlinkplatform.service.impl;
 
-import cn.hutool.core.date.DateField;
+
 import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.util.StrUtil;
+import com.alibaba.csp.sentinel.annotation.SentinelResource;
+import com.alibaba.csp.sentinel.slots.block.BlockException;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
-import com.baomidou.mybatisplus.extension.repository.AbstractRepository;
-import com.baomidou.mybatisplus.extension.service.IService;
+import com.liu.shortlinkplatform.cache.ShortLinkCacheManager;
 import com.liu.shortlinkplatform.common.Result;
+import com.liu.shortlinkplatform.config.RabbitMQConfig;
 import com.liu.shortlinkplatform.config.ShortLinkBloomFilter;
 import com.liu.shortlinkplatform.config.ShortLinkConfig;
 import com.liu.shortlinkplatform.dto.ShortLinkCreateDto;
@@ -24,217 +26,115 @@ import com.liu.shortlinkplatform.utils.IdGenerator;
 import com.liu.shortlinkplatform.utils.ShortCode;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
+
+import org.apache.catalina.AccessLog;
+import org.apache.catalina.connector.Request;
+import org.apache.catalina.connector.Response;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 
-import java.time.LocalDateTime;
+
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+
 
 
 @Slf4j
 @Service
 public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLinkEntity> implements IShortLinkService {
 
-//public class ShortLinkServiceImpl implements IShortLinkService {
     @Resource
     private IdGenerator idGenerator;
     @Resource
     private ShortCode shortCode;
     @Resource
-    private ShortLinkMapper shortLinkMapper;
-    @Resource
     private ShortLinkConfig shortLinkConfig;
     @Resource
-    private StringRedisTemplate stringRedisTemplate;
-    @Resource
     private ShortLinkAccessLogMapper accessLogMapper;
-
     @Resource
     private ShortLinkBloomFilter shortLinkBloomFilter;
+    @Resource
+    private ShortLinkCacheManager cacheManager;
+    @Resource
+    private RabbitTemplate rabbitTemplate;
+
 
     /**
      * 创建短链接
      */
+    @SentinelResource(
+            value = "createShortLink",
+            blockHandler = "createBlockHandler",
+            fallback = "createFallbackHandler"
+    )
     @Transactional(rollbackFor = Exception.class)//异常回滚
     @Override
     public Result<String> createShortLink(ShortLinkCreateDto dto){
-        log.info("创建短链接开始:longUrl={},customCode={},expireTime={}",
-                dto.getLongUrl(),dto.getCustomCode(),dto.getCustomCode());
 
-        String codeShort;
-        if (StrUtil.isNotBlank(dto.getCustomCode())){
-            //校验自定义短码是否已经存在
-            ShortLinkEntity existLink = this.getOne(
-                    new LambdaQueryWrapper<ShortLinkEntity>()
-                            .eq(ShortLinkEntity::getShortCode, dto.getCustomCode())
-                            .eq(ShortLinkEntity::getStatus, 0)
-            );
-            if (existLink != null){
-                throw new BusinessException("自定义短码已存在");
-            }
-            codeShort = dto.getCustomCode();
-        }else {
-            // 生成ID
-            long id = idGenerator.generateId();
-            //生成6位短码
-            codeShort = shortCode.idToShortCode(id);
-            //双重校验短码唯一性
-            ShortLinkEntity existLink = this.getOne(
-                    new LambdaQueryWrapper<ShortLinkEntity>()
-                            .eq(ShortLinkEntity::getShortCode, codeShort)
-                            .eq(ShortLinkEntity::getIsDeleted, 0)
-            );
-            if (existLink != null){
-                throw new BusinessException("短码生成冲突，请稍后再试");
-            }
-        }
-        //过期时间合理性校验
-        if(dto.getExpireTime()!=null){
-            Date now = DateUtil.truncate(new Date(), DateField.SECOND);
-            Date expireDate = DateUtil.parse(dto.getExpireTime());
-            if (expireDate.before(now)){
-                log.error("过期时间不能早于当前时间");
-                throw new BusinessException("过期时间不能早于当前时间");
-            }
-        }
-        //生成实体
-        ShortLinkEntity shortLinkEntity = new ShortLinkEntity();
-        shortLinkEntity.setId(idGenerator.generateId());
-        shortLinkEntity.setLongUrl(dto.getLongUrl());
-        shortLinkEntity.setShortCode(codeShort);
-        shortLinkEntity.setCreateTime(new Date());
-        shortLinkEntity.setStatus(1);//默认有效
-        //处理过期时间
-        if (StrUtil.isNotBlank(dto.getExpireTime())){
-            try {
-                shortLinkEntity.setExpireTime(DateUtil.parse(dto.getExpireTime()));
-            } catch (Exception e){
-                throw new BusinessException("过期时间格式错误，请输入yyyy-MM-dd HH:mm:ss");
-            }
-        }
-        shortLinkEntity.setVisitCount(0);//默认0
-        shortLinkEntity.setIsDeleted(0);//默认未删除
-        //4. 入库
+        //短码校验
+        String shortCode = generateShortCode(dto);
+        //构建实体
+        ShortLinkEntity shortLinkEntity = buildeShortLinkEntity(dto, shortCode);
         boolean saveSuccess = this.save(shortLinkEntity);
         if (!saveSuccess){
             log.error("链接入库失败，shortCode={}",shortCode);
             throw new BusinessException("短链接创建失败");
         }
+        //布隆过滤+缓存预热
+        shortLinkBloomFilter.add(shortCode);
+        cacheManager.setCache(shortLinkEntity);
+        return Result.success(shortLinkConfig.getDomain() +"/short-link/r/" +shortCode);
 
-        //布隆过滤器：新增短码
-        shortLinkBloomFilter.add(codeShort);
-
-        //缓存预热（Redis)
-        String cacheKey = shortLinkConfig.getCache().getPrefix() + codeShort;
-        Long expireSeconds;
-        if (dto.getExpireTime()!=null){
-            //业务过期时间有效：计算expireTime与当前时间的差值
-            Date now = new Date();
-            Date expireDate = DateUtil.parse(dto.getExpireTime());
-            expireSeconds = (expireDate.getTime() - now.getTime())/1000 +1;
-            if (expireSeconds <= 0){
-                expireSeconds = 1L;
-            }
-        }else {
-            // 使用配置文件的默认过期时间
-            expireSeconds = shortLinkConfig.getCache().getExpireSeconds();
-        }
-        //写入Redis Hash
-        //存储长连接
-        stringRedisTemplate.opsForHash().put(cacheKey, "longUrl", dto.getLongUrl());
-        if (dto.getExpireTime()!=null){
-            //存储过期时间戳
-            Date expireDate = DateUtil.parse(dto.getExpireTime(), "yyyy-MM-dd HH:mm:ss");
-            stringRedisTemplate.opsForHash().put(cacheKey, "expireTime", String.valueOf(expireDate.getTime()));
-        }
-
-        //设置Redis过期时间
-        stringRedisTemplate.expire(cacheKey,expireSeconds , TimeUnit.SECONDS);
-        //拼接完整短链接
-        String shortUrl = shortLinkConfig.getDomain() + "/short-link/r/" + codeShort;
-        return Result.success(shortUrl);
     }
-
-
 
     /**
      * 短链接跳转
      */
     @Override
     public Result<String> getLongUrlByShortCode(String shortCode){
-        // 布隆过滤器拦截无效短码
+        //布隆过滤器拦截无效短码
         if (!shortLinkBloomFilter.contains(shortCode)){
-            log.warn("布隆过滤拦截无效短码：{}",shortCode);
             throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
         }
-
-        log.info("短链接跳转开始，shortCode={}",shortCode);
-        //检验短码合法性
-        if(!this.shortCode.isValidShortCode(shortCode)){
+        if (!this.shortCode.isValidShortCode(shortCode)){
             throw new BusinessException("短码不合法");
         }
 
-        String cacheKey = shortLinkConfig.getCache().getPrefix() + shortCode;
-        //查Redis缓存
-        if (stringRedisTemplate.hasKey(cacheKey)) {
-            String longUrl = (String) stringRedisTemplate.opsForHash().get(cacheKey, "longUrl");
-            String expireTime = (String) stringRedisTemplate.opsForHash().get(cacheKey, "expireTime");
-            //二次校验是否过期
-            if (StrUtil.isNotBlank(expireTime)) {
-                long expireTimeStamp = Long.parseLong(expireTime);
-                if (expireTimeStamp < System.currentTimeMillis()) {
-                    //缓存已过期
-                    stringRedisTemplate.delete(cacheKey);
-                    log.debug("缓存已过期，key={}", cacheKey);
-                    throw new BusinessException(ResultCodeEnum.SHORT_LINK_EXPIRED);
-                }
-            } else {
-                //缓存默认过期时间
-                log.debug("从Redis缓存中获取短链接成功，key={},value={}", cacheKey, longUrl);
-                //异步记录访问日志
-                recordAccessLog(shortCode, getClientIp());
-                updateVisitCount(shortCode);
-                return Result.success(longUrl);
-            }
+        //查缓存
+        String cacheResult = cacheManager.getCacheWithLock(shortCode);
+        if (cacheResult != null){
+            if ("NULL".equals(cacheResult))
+                throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
+            ShortLinkAccessLog accessLog = new ShortLinkAccessLog();
+            accessLog.setShortCode(shortCode);
+            accessLog.setAccessIp(getClientIp());
+            accessLog.setAccessTime(new Date());
+            accessLog.setAccessSource("PC");
+            updateVisitCount(shortCode);
+            return Result.success(cacheResult);
         }
-        //缓存未命中
-        ShortLinkEntity shortLinkEntity = this.getOne(
-                new LambdaQueryWrapper<ShortLinkEntity>()
-                        .eq(ShortLinkEntity::getShortCode, shortCode)
-                        .eq(ShortLinkEntity::getStatus, 1)
-        );
-        if (shortLinkEntity == null){
-            log.warn("短链接不存在，shortCode={}",shortCode);
-            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
-        }
-        //校验状态
-        if (shortLinkEntity.getStatus() != 1){
-            log.warn("短链接已禁用，shortCode={}",shortCode);
-            throw new BusinessException(ResultCodeEnum.SHORT_LINK_DISABLE);
-        }
-        //校验过期时间
-        if (shortLinkEntity.getExpireTime() != null && shortLinkEntity.getExpireTime().before(new Date())){
-            log.warn("短链接已过期，shortCode={}",shortCode);
-            throw new BusinessException(ResultCodeEnum.SHORT_LINK_EXPIRED);
-        }
+
+        //查库
+        ShortLinkEntity shortLinkEntity = getValidShortLink(shortCode);
         //写回缓存
-        stringRedisTemplate.opsForValue().set(cacheKey, shortLinkEntity.getLongUrl());
-        if (shortLinkEntity.getExpireTime() != null){
-            stringRedisTemplate.opsForHash().put(cacheKey, "expireTime",String.valueOf(shortLinkEntity.getExpireTime().getTime()));
-        }
-        stringRedisTemplate.expire(cacheKey, shortLinkConfig.getCache().getExpireSeconds(), TimeUnit.SECONDS);
-        //记录访问日志和更新次数
-        recordAccessLog(shortCode,getClientIp());
-        updateVisitCount(shortCode);
-        log.info("查询短链接成功：shortCode={}, longUrl={}", shortCode, shortLinkEntity.getLongUrl());
+        cacheManager.setCache(shortLinkEntity);
+        //日志计数
+        ShortLinkAccessLog accessLog = new ShortLinkAccessLog();
+        accessLog.setShortCode(shortCode);
+        accessLog.setAccessIp(getClientIp());
+        accessLog.setAccessTime(new Date());
+        accessLog.setAccessSource("PC");
+        //异步发送
+        rabbitTemplate.convertAndSend(RabbitMQConfig.ACCESS_LOG_QUEUE, log);
+
         return Result.success(shortLinkEntity.getLongUrl());
     }
+
+
 
     /**
      * 修改短链接状态（启用/禁用）
@@ -242,39 +142,18 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     @Transactional(rollbackFor = Exception.class)
     @Override
     public Result<Void> updateStatus(ShortLinkStatusDto dto) {
-        log.info("修改短链接状态：shortCode={}, targetStatus={}", dto.getShortCode(), dto.getStatus());
 
-        // 1. 校验状态合法性
-        if (dto.getStatus() != 0 && dto.getStatus() != 1) {
+        if (dto.getStatus() !=0 && dto.getStatus() != 1){
             throw new BusinessException(ResultCodeEnum.PARAM_ERROR.getCode(), "状态只能是0（禁用）或1（启用）");
         }
 
-        // 2. 校验短链接是否存在（未删除）
-        ShortLinkEntity shortLink = this.getOne(new LambdaQueryWrapper<ShortLinkEntity>()
-                .eq(ShortLinkEntity::getShortCode, dto.getShortCode())
-                .eq(ShortLinkEntity::getIsDeleted, 0));
-        if (shortLink == null) {
-            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
-        }
-
-        // 3. 修改状态
-        boolean updateSuccess = this.update(new LambdaUpdateWrapper<ShortLinkEntity>()
+        //更新数据库
+        update(new LambdaUpdateWrapper<ShortLinkEntity>()
                 .set(ShortLinkEntity::getStatus, dto.getStatus())
-                .eq(ShortLinkEntity::getShortCode, dto.getShortCode())
-                .eq(ShortLinkEntity::getIsDeleted, 0));
-        if (!updateSuccess) {
-            log.error("修改短链接状态失败：shortCode={}", dto.getShortCode());
-            throw new BusinessException("修改状态失败");
-        }
+                .eq(ShortLinkEntity::getShortCode, dto.getShortCode()));
 
-        // 4. 禁用时删除缓存
-        if (dto.getStatus() == 0) {
-            String cacheKey = shortLinkConfig.getCache().getPrefix() + dto.getShortCode();
-            stringRedisTemplate.delete(cacheKey);
-            log.debug("禁用短链接，删除缓存：{}", cacheKey);
-        }
-
-        log.info("修改短链接状态成功：shortCode={}, status={}", dto.getShortCode(), dto.getStatus());
+        //删除缓存
+        cacheManager.deleteCacheWithDelay(dto.getShortCode());
         return Result.success();
     }
 
@@ -285,30 +164,10 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     @Transactional(rollbackFor = Exception.class)
     @Override
     public Result<Void> deleteShortLink(String shortCode) {
-        log.info("删除短链接：shortCode={}", shortCode);
 
-        // 1. 校验短链接是否存在
-        ShortLinkEntity shortLink = this.getOne(new LambdaQueryWrapper<ShortLinkEntity>()
-                .eq(ShortLinkEntity::getShortCode, shortCode)
-                .eq(ShortLinkEntity::getIsDeleted, 0));
-        if (shortLink == null) {
-            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
-        }
-
-        // 2. 逻辑删除（MP的@TableLogic自动处理）
-        boolean deleteSuccess = this.remove(new LambdaQueryWrapper<ShortLinkEntity>()
-                .eq(ShortLinkEntity::getShortCode, shortCode)
-                .eq(ShortLinkEntity::getIsDeleted, 0));
-        if (!deleteSuccess) {
-            log.error("删除短链接失败：shortCode={}", shortCode);
-            throw new BusinessException("删除失败");
-        }
-
-        // 3. 删除缓存
-        String cacheKey = shortLinkConfig.getCache().getPrefix() + shortCode;
-        stringRedisTemplate.delete(cacheKey);
-
-        log.info("删除短链接成功：shortCode={}", shortCode);
+        remove(new LambdaQueryWrapper<ShortLinkEntity>()
+                .eq(ShortLinkEntity::getShortCode, shortCode));
+        cacheManager.deleteCacheWithDelay(shortCode);
         return Result.success();
     }
 
@@ -317,7 +176,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
      */
     @Override
     public Result<Map<String, Object>> getAccessStat(ShortLinkStatDto dto) {
-        log.info("查询短链接统计：shortCode={}, startTime={}, endTime={}",
+       /* log.info("查询短链接统计：shortCode={}, startTime={}, endTime={}",
                 dto.getShortCode(), dto.getStartTime(), dto.getEndTime());
 
         // 1. 校验短链接是否存在
@@ -353,8 +212,91 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
         statResult.put("expireTime", shortLink.getExpireTime());
 
         log.info("查询短链接统计成功：shortCode={}, totalCount={}", dto.getShortCode(), totalCount);
-        return Result.success(statResult);
+        return Result.success(statResult);*/
+        ShortLinkEntity link = getOne(new LambdaQueryWrapper<ShortLinkEntity>()
+                .eq(ShortLinkEntity::getShortCode, dto.getShortCode())
+                .eq(ShortLinkEntity::getIsDeleted, 0));
+        if (link == null){
+            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
+        }
+        LambdaQueryWrapper<ShortLinkAccessLog> queryWrapper = new LambdaQueryWrapper<ShortLinkAccessLog>()
+                .eq(ShortLinkAccessLog::getShortCode, dto.getShortCode());
+        if (StrUtil.isNotBlank(dto.getStartTime())){
+            queryWrapper.ge(ShortLinkAccessLog::getAccessTime, DateUtil.parse(dto.getStartTime()));
+        }
+        if (StrUtil.isNotBlank(dto.getEndTime())){
+            queryWrapper.le(ShortLinkAccessLog::getAccessTime, DateUtil.parse(dto.getEndTime()));
+        }
+
+        Map<String, Object> map = new HashMap<>();
+        map.put("totalVisitCount", accessLogMapper.selectCount(queryWrapper));
+        map.put("longUrl",link.getLongUrl());
+        map.put("status",link.getStatus() == 1 ? "启用" : "禁用");
+        return Result.success(map);
     }
+
+    /**
+     * 短码生成和校验
+     */
+    private String generateShortCode(ShortLinkCreateDto dto){
+        if (StrUtil.isNotBlank(dto.getCustomCode())){
+            if (getOne(new LambdaQueryWrapper<ShortLinkEntity>()
+                    .eq(ShortLinkEntity::getShortCode, dto.getCustomCode())
+                    .eq(ShortLinkEntity::getStatus, 1))!= null){
+                throw new BusinessException("自定义短码已存在");
+            }
+            return dto.getCustomCode();
+        }
+        String code = shortCode.idToShortCode(idGenerator.generateId());
+        if (getOne(new LambdaQueryWrapper<ShortLinkEntity>()
+                .eq(ShortLinkEntity::getShortCode, code))!= null){
+           throw new BusinessException("短码生成冲突");
+        }
+        return code;
+    }
+
+    /**
+     * 创建实体
+     */
+    private ShortLinkEntity buildeShortLinkEntity(ShortLinkCreateDto dto, String shortCode){
+        ShortLinkEntity entity = new ShortLinkEntity();
+        entity.setId(idGenerator.generateId());
+        entity.setShortCode(shortCode);
+        entity.setLongUrl(dto.getLongUrl());
+        entity.setStatus(1);
+        entity.setIsDeleted(0);
+        entity.setCreateTime(new Date());
+        entity.setVisitCount(0);
+        if (StrUtil.isNotBlank(dto.getExpireTime())){
+            if (DateUtil.parse(dto.getExpireTime()).getTime() > System.currentTimeMillis()) {
+                entity.setExpireTime(DateUtil.parse(dto.getExpireTime()));
+            }else {
+                throw new BusinessException("短链接已过期");
+            }
+        }
+
+        return entity;
+    }
+
+
+    /**
+     * 查库
+     */
+    private ShortLinkEntity getValidShortLink(String shortCode){
+        ShortLinkEntity entity = getOne(new LambdaQueryWrapper<ShortLinkEntity>()
+                .eq(ShortLinkEntity::getShortCode, shortCode)
+                .eq(ShortLinkEntity::getStatus, 1)
+                .eq(ShortLinkEntity::getIsDeleted, 0));
+        if (entity == null){
+            cacheManager.setNullCache(shortCode);
+            throw new BusinessException(ResultCodeEnum.SHORT_LINK_NOT_EXIT);
+        }
+        if (entity.getExpireTime()!= null && entity.getExpireTime().before(new Date())){
+            throw new BusinessException(ResultCodeEnum.SHORT_LINK_EXPIRED);
+        }
+        return entity;
+    }
+
 
     /**
      * 异步记录访问日志
@@ -394,6 +336,15 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
     private String getClientIp() {
         // 生产环境需从RequestContextHolder获取真实IP，简化返回固定值
         return "127.0.0.1";
+    }
+
+    //热点限流
+    public Result<String> createBlockHandler(ShortLinkCreateDto dto, BlockException ex) {
+       return Result.fail("请求过于频繁！禁止恶意批量创建短链接");
+    }
+    // 降级处理
+    public Result<Void> createFallbackHandler(ShortLinkStatusDto dto) {
+        return Result.fail("系统繁忙，请稍后再试");
     }
 
 

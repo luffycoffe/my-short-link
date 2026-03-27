@@ -1,4 +1,9 @@
 spring:
+  cloud:
+    sentinel:
+      # 关闭控制台（本地简单使用，无需部署控制台）
+      enabled: true
+      web-context-unify: false
   #数据库配置
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
@@ -18,6 +23,14 @@ spring:
           max-idle: 10
           min-idle: 1
           time-between-eviction-runs: 10s
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    # 消息确认
+    publisher-confirm-type: correlated
+    publisher-returns: true
 #短链接缓存配置
 short-link:
   cache:

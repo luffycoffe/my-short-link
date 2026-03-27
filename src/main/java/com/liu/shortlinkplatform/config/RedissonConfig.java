@@ -19,7 +19,9 @@ public class RedissonConfig {
                 .setAddress("redis://192.168.106.130:6379")
                 .setPassword("123321")   // 在这里设置密码
                 .setConnectionMinimumIdleSize(5)
-                .setConnectionPoolSize(10);
+                .setConnectionPoolSize(10)
+                .setDatabase(1);
+
 
         return Redisson.create(config);
 
